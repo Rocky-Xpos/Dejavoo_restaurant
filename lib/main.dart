@@ -1,0 +1,42 @@
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
+
+import 'src/models.dart';
+import 'src/screens/floor_screen.dart';
+
+/// XPOS Tableside — order-taking app for Dejavoo P-series (Android) payment
+/// terminals. Connects to the XPOS register over the restaurant's Wi-Fi:
+/// the floor plan and menu come from the register, and placed orders fire the
+/// kitchen display and station chit printers there. Works with no internet.
+///
+/// Payments stay on the terminal's existing Dejavoo SPIn flow for now — the
+/// hook point for in-app payment is after the register closes the check.
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  SystemChrome.setPreferredOrientations(
+      [DeviceOrientation.portraitUp, DeviceOrientation.portraitDown]);
+  WakelockPlus.enable().catchError((_) {});
+  runApp(const TablesideApp());
+}
+
+class TablesideApp extends StatelessWidget {
+  const TablesideApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final base = ThemeData.dark(useMaterial3: true);
+    return MaterialApp(
+      title: 'XPOS Tableside',
+      debugShowCheckedModeBanner: false,
+      theme: base.copyWith(
+        scaffoldBackgroundColor: DColors.bg,
+        colorScheme: base.colorScheme.copyWith(
+          primary: DColors.primary,
+          surface: DColors.surface,
+        ),
+      ),
+      home: const FloorScreen(),
+    );
+  }
+}
