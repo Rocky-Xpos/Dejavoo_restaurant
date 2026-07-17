@@ -10,8 +10,10 @@ import 'src/screens/floor_screen.dart';
 /// the floor plan and menu come from the register, and placed orders fire the
 /// kitchen display and station chit printers there. Works with no internet.
 ///
-/// Payments stay on the terminal's existing Dejavoo SPIn flow for now — the
-/// hook point for in-app payment is after the register closes the check.
+/// Payments run in-app through DvPayLite (the Dejavoo payment app on this
+/// same terminal) over the `xpos/dvpay` MethodChannel: the register issues a
+/// payment intent, this app drives the SALE/VOID/STATUS, and the result is
+/// persisted until the register acks it (see src/services/payment_outbox.dart).
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   SystemChrome.setPreferredOrientations(

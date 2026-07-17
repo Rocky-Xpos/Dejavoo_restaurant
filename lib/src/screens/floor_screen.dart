@@ -5,7 +5,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../client.dart';
 import '../models.dart';
+import '../services/dvpay.dart';
+import '../services/payment_outbox.dart';
 import 'order_screen.dart';
+import 'pay_screen.dart';
 
 /// Home screen of the tableside app: live floor plan (pushed by the register),
 /// tap a table to seat/resume, then take the order.
@@ -22,6 +25,7 @@ class _FloorScreenState extends State<FloorScreen> {
   String _statusText = 'Starting…';
   bool _connected = false;
   int? _roomId;
+  PaymentResultOutbox? _outbox;
   final List<StreamSubscription> _subs = [];
 
   @override
@@ -30,11 +34,16 @@ class _FloorScreenState extends State<FloorScreen> {
     _subs.add(_client.floor.listen((f) => setState(() => _floor = f)));
     _subs.add(_client.status.listen((s) => setState(() => _statusText = s)));
     _subs.add(_client.connected.listen((c) => setState(() => _connected = c)));
+    _subs.add(_client.collectRequests.listen(_onCollectRequest));
+    _subs.add(_client.voidRequests.listen(_onVoidRequest));
     _startFromPrefs();
   }
 
   Future<void> _startFromPrefs() async {
     final prefs = await SharedPreferences.getInstance();
+    // Outbox before connect: a payment_result stored by a previous run is
+    // re-delivered as soon as the register link comes up.
+    _outbox = PaymentResultOutbox(prefs: prefs, client: _client)..start();
     await _client.start(manualHost: prefs.getString('manual_host'));
   }
 
@@ -43,8 +52,78 @@ class _FloorScreenState extends State<FloorScreen> {
     for (final s in _subs) {
       s.cancel();
     }
+    _outbox?.dispose();
     _client.dispose();
     super.dispose();
+  }
+
+  // -------------------------------------------------------------- payments
+
+  /// Register asked THIS terminal to collect a payment (verb 4): the client
+  /// already acked, so just present the full-screen payment flow.
+  Future<void> _onCollectRequest(Map<String, dynamic> intent) async {
+    final outbox = _outbox;
+    if (!mounted || outbox == null) return;
+    await Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) =>
+          PayScreen(client: _client, outbox: outbox, intent: intent),
+    ));
+    _client.requestFloor();
+  }
+
+  /// Register asked for a VOID (verb 5, manager PIN already validated
+  /// register-side): run it against DvPayLite behind a brief blocking
+  /// overlay and report the void_result.
+  Future<void> _onVoidRequest(Map<String, dynamic> req) async {
+    if (!mounted) return;
+    _client.busy = true;
+    BuildContext? overlayCtx;
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogCtx) {
+        overlayCtx = dialogCtx;
+        return const _VoidOverlay();
+      },
+    );
+    try {
+      final refId = '${req['refId'] ?? ''}';
+      final amount = ((req['amount'] as num?) ?? 0).toDouble();
+      final r = await DvPay.voidTxn(amount: amount, refId: refId);
+      _client.send({
+        'type': 'void_result',
+        'intentId': req['intentId'],
+        'checkId': req['checkId'],
+        'refId': refId,
+        'status': r.isApproved ? 'success' : 'failed',
+        'statusCode': r.statusCode,
+        'message': r.message,
+        'device': _client.deviceName,
+      });
+    } finally {
+      _client.busy = false;
+      final ctx = overlayCtx;
+      if (ctx != null && ctx.mounted) Navigator.of(ctx).pop();
+      if (mounted) _client.requestFloor();
+    }
+  }
+
+  Future<void> _collectForCheck(int checkId) async {
+    final outbox = _outbox;
+    if (outbox == null) return;
+    final resp = await _client.paymentIntent(checkId);
+    if (!mounted) return;
+    if (resp['type'] != 'payment_intent_ok') {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          backgroundColor: DColors.danger,
+          content:
+              Text('${resp['message'] ?? 'Could not start the payment'}')));
+      return;
+    }
+    await Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => PayScreen(client: _client, outbox: outbox, intent: resp),
+    ));
+    _client.requestFloor();
   }
 
   Future<void> _openTable(TableM table) async {
@@ -53,6 +132,17 @@ class _FloorScreenState extends State<FloorScreen> {
           content: Text('Table is paid — clear it from the register')));
       return;
     }
+    // Occupied table with a live check: order more, or collect the payment.
+    if (table.status != 'open' && table.checkId != null && _outbox != null) {
+      final action = await _pickTableAction(table);
+      if (action == null || !mounted) return;
+      if (action == 'collect') {
+        await _collectForCheck(table.checkId!);
+        return;
+      }
+      // 'order' falls through to the normal resume flow.
+    }
+    if (!mounted) return;
     int guests = table.status == 'open' ? table.seats.clamp(1, 12) : table.guests;
     if (table.status == 'open') {
       final picked = await _pickGuests(table.label, guests);
@@ -72,9 +162,59 @@ class _FloorScreenState extends State<FloorScreen> {
         checkId: (resp['checkId'] as num).toInt(),
         tableLabel: table.label,
         guests: (resp['guests'] as num?)?.toInt() ?? guests,
+        outbox: _outbox,
       ),
     ));
     _client.requestFloor();
+  }
+
+  Future<String?> _pickTableAction(TableM table) {
+    return showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: DColors.surface,
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(18))),
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 16, 20, 6),
+              child: Row(children: [
+                Text('Table ${table.label} · ${table.guests} guests',
+                    style: const TextStyle(
+                        color: DColors.text,
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700)),
+                const Spacer(),
+                if (table.total > 0)
+                  Text('\$${table.total.toStringAsFixed(2)}',
+                      style: const TextStyle(
+                          color: DColors.textMuted,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600)),
+              ]),
+            ),
+            ListTile(
+              leading:
+                  const Icon(Icons.restaurant_menu, color: DColors.textMuted),
+              title: const Text('Open order',
+                  style: TextStyle(color: DColors.text, fontSize: 14)),
+              onTap: () => Navigator.pop(context, 'order'),
+            ),
+            ListTile(
+              leading:
+                  const Icon(Icons.payments_outlined, color: DColors.success),
+              title: const Text('Collect payment',
+                  style: TextStyle(color: DColors.text, fontSize: 14)),
+              onTap: () => Navigator.pop(context, 'collect'),
+            ),
+            const SizedBox(height: 6),
+          ],
+        ),
+      ),
+    );
   }
 
   Future<void> _startTakeout() async {
@@ -91,6 +231,7 @@ class _FloorScreenState extends State<FloorScreen> {
         checkId: (resp['checkId'] as num).toInt(),
         tableLabel: 'TAKEOUT',
         guests: 1,
+        outbox: _outbox,
       ),
     ));
     _client.requestFloor();
@@ -390,6 +531,36 @@ class _FloorScreenState extends State<FloorScreen> {
         dot('Check', 'check_drop'),
         dot('Bus', 'needs_bus'),
       ]),
+    );
+  }
+}
+
+/// Brief blocking overlay while a register-initiated VOID runs on DvPayLite.
+class _VoidOverlay extends StatelessWidget {
+  const _VoidOverlay();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Dialog(
+      backgroundColor: DColors.surface,
+      shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.all(Radius.circular(14))),
+      child: Padding(
+        padding: EdgeInsets.symmetric(horizontal: 24, vertical: 22),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          SizedBox(
+              width: 22,
+              height: 22,
+              child: CircularProgressIndicator(
+                  strokeWidth: 2.5, color: DColors.primary)),
+          SizedBox(width: 14),
+          Text('Processing void…',
+              style: TextStyle(
+                  color: DColors.text,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600)),
+        ]),
+      ),
     );
   }
 }

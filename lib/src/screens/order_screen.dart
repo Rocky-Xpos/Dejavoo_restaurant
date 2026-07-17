@@ -5,6 +5,8 @@ import 'package:flutter/material.dart';
 
 import '../client.dart';
 import '../models.dart';
+import '../services/payment_outbox.dart';
+import 'pay_screen.dart';
 
 /// Tableside ordering: category chips + item list, modifier sheet, cart, and
 /// Send — which places the whole batch on the register (KDS + chits fire
@@ -14,12 +16,16 @@ class OrderScreen extends StatefulWidget {
   final int checkId;
   final String tableLabel;
   final int guests;
+
+  /// When present, the order-sent dialog offers 'Collect payment'.
+  final PaymentResultOutbox? outbox;
   const OrderScreen({
     super.key,
     required this.client,
     required this.checkId,
     required this.tableLabel,
     required this.guests,
+    this.outbox,
   });
 
   @override
@@ -319,7 +325,7 @@ class _OrderScreenState extends State<OrderScreen> {
     if (resp['type'] == 'order_placed') {
       _orderToken = null;
       final printErrors = (resp['printErrors'] as List? ?? []);
-      await showDialog(
+      final action = await showDialog<String>(
         context: context,
         builder: (context) => AlertDialog(
           backgroundColor: DColors.surface,
@@ -338,8 +344,15 @@ class _OrderScreenState extends State<OrderScreen> {
             style: const TextStyle(color: DColors.textMuted, fontSize: 13),
           ),
           actions: [
+            if (widget.outbox != null)
+              TextButton(
+                onPressed: () => Navigator.pop(context, 'collect'),
+                child: const Text('Collect payment',
+                    style: TextStyle(
+                        color: DColors.text, fontWeight: FontWeight.w600)),
+              ),
             ElevatedButton(
-              onPressed: () => Navigator.pop(context),
+              onPressed: () => Navigator.pop(context, 'done'),
               style: ElevatedButton.styleFrom(
                   backgroundColor: DColors.primary, foregroundColor: Colors.white),
               child: const Text('Done'),
@@ -347,12 +360,37 @@ class _OrderScreenState extends State<OrderScreen> {
           ],
         ),
       );
-      if (mounted) Navigator.of(context).pop();
+      if (!mounted) return;
+      if (action == 'collect') {
+        await _collectPayment();
+        if (!mounted) return;
+      }
+      Navigator.of(context).pop();
     } else {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
           backgroundColor: DColors.danger,
           content: Text('${resp['message'] ?? 'Order failed'}')));
     }
+  }
+
+  /// Order sent → straight into payment: ask the register for an intent on
+  /// this check, then run the full-screen payment flow.
+  Future<void> _collectPayment() async {
+    final outbox = widget.outbox;
+    if (outbox == null) return;
+    final resp = await widget.client.paymentIntent(widget.checkId);
+    if (!mounted) return;
+    if (resp['type'] != 'payment_intent_ok') {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          backgroundColor: DColors.danger,
+          content:
+              Text('${resp['message'] ?? 'Could not start the payment'}')));
+      return;
+    }
+    await Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => PayScreen(
+          client: widget.client, outbox: outbox, intent: resp),
+    ));
   }
 
   void _showCart() {

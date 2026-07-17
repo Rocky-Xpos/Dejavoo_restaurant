@@ -4,11 +4,20 @@ import 'dart:io';
 
 import 'models.dart';
 
+/// The slice of [OrderClient] the payment-result outbox depends on — kept
+/// small so tests can substitute a fake.
+abstract class PaymentTransport {
+  bool get isConnected;
+  Stream<bool> get connected;
+  Future<Map<String, dynamic>> sendPaymentResult(Map<String, dynamic> result);
+  Future<Map<String, dynamic>> paymentStatus(String intentId);
+}
+
 /// LAN client for the XPOS register's order channel (WebSocket :7171, UDP
 /// discovery :7172). Identifies as role 'order'; the register applies the
 /// verbs to its offline-first database, fires the kitchen display and prints
 /// station chits — this terminal never needs the internet.
-class OrderClient {
+class OrderClient implements PaymentTransport {
   static const int wsPort = 7171;
   static const int udpPort = 7172;
   static const String beaconPrefix = 'XPOS_KDS_HOST:';
@@ -28,16 +37,32 @@ class OrderClient {
   final _menu = StreamController<MenuData>.broadcast();
   final _status = StreamController<String>.broadcast();
   final _connected = StreamController<bool>.broadcast();
+  final _collect = StreamController<Map<String, dynamic>>.broadcast();
+  final _voids = StreamController<Map<String, dynamic>>.broadcast();
 
   /// Latest snapshots, for screens that mount after they arrived.
   FloorData lastFloor = FloorData.empty;
   MenuData lastMenu = MenuData.empty;
 
+  /// True while the payment UI has a payment in flight on this terminal.
+  /// Maintained by the UI; incoming collect_payment / void_payment pushes are
+  /// refused (collect_ack accepted:false reason 'busy') while set.
+  bool busy = false;
+
   Stream<FloorData> get floor => _floor.stream;
   Stream<MenuData> get menu => _menu.stream;
   Stream<String> get status => _status.stream;
+  @override
   Stream<bool> get connected => _connected.stream;
+  @override
   bool get isConnected => _ws != null;
+
+  /// Register-initiated `collect_payment` pushes (already collect_ack'd).
+  Stream<Map<String, dynamic>> get collectRequests => _collect.stream;
+
+  /// Register-initiated `void_payment` pushes (already collect_ack'd). The
+  /// listener runs the DvPayLite VOID and sends back a `void_result`.
+  Stream<Map<String, dynamic>> get voidRequests => _voids.stream;
 
   final Map<String, Completer<Map<String, dynamic>>> _pending = {};
 
@@ -110,10 +135,23 @@ class OrderClient {
           _complete('check_opened', map);
         case 'order_placed':
           _complete('order_placed', map);
+        case 'payment_intent_ok':
+          _complete('payment_intent_ok', map);
+        case 'payment_recorded':
+          _complete('payment_recorded', map);
+        case 'payment_status_result':
+          _complete('payment_status_result', map);
+        case 'collect_payment':
+          _ackAndForward(map, _collect);
+        case 'void_payment':
+          _ackAndForward(map, _voids);
         case 'error':
           // An error answers whichever request is in flight.
           _complete('check_opened', map);
           _complete('order_placed', map);
+          _complete('payment_intent_ok', map);
+          _complete('payment_recorded', map);
+          _complete('payment_status_result', map);
         default:
           break;
       }
@@ -123,6 +161,20 @@ class OrderClient {
   void _complete(String key, Map<String, dynamic> map) {
     final c = _pending.remove(key);
     if (c != null && !c.isCompleted) c.complete(map);
+  }
+
+  /// Acks a register push IMMEDIATELY (protocol verbs 4/5) and forwards it to
+  /// the UI stream unless a payment is already in flight on this terminal.
+  void _ackAndForward(
+      Map<String, dynamic> map, StreamController<Map<String, dynamic>> out) {
+    final accepted = !busy;
+    send({
+      'type': 'collect_ack',
+      'intentId': map['intentId'],
+      'accepted': accepted,
+      if (!accepted) 'reason': 'busy',
+    });
+    if (accepted) out.add(map);
   }
 
   void _onDisconnected() {
@@ -195,6 +247,37 @@ class OrderClient {
     });
   }
 
+  /// Asks the register to open a payment attempt for [checkId].
+  /// Response: payment_intent_ok{intentId, checkId, checkNo, tableLabel,
+  /// amountDue, subTotal, tax, total, alreadyPaid}.
+  Future<Map<String, dynamic>> paymentIntent(int checkId) {
+    return _request('payment_intent_ok', {
+      'type': 'payment_intent',
+      'checkId': checkId,
+      'device': deviceName,
+    });
+  }
+
+  /// Sends a fully-built `payment_result` message (see PayScreen /
+  /// PaymentResultOutbox — persist-then-send lives there, not here).
+  /// Response: payment_recorded{intentId, checkId, accepted, reason?,
+  /// checkStatus, balanceDue}.
+  @override
+  Future<Map<String, dynamic>> sendPaymentResult(Map<String, dynamic> result) {
+    return _request('payment_recorded', result);
+  }
+
+  /// "Did my result land?" — asked before re-sending a stored result or
+  /// firing a DvPayLite STATUS. Response: payment_status_result{intentId,
+  /// state: pending|recorded|rejected|unknown, checkId?}.
+  @override
+  Future<Map<String, dynamic>> paymentStatus(String intentId) {
+    return _request('payment_status_result', {
+      'type': 'payment_status',
+      'intentId': intentId,
+    });
+  }
+
   void requestFloor() => send({'type': 'floor_request'});
   void requestMenu() => send({'type': 'menu_request'});
 
@@ -215,5 +298,7 @@ class OrderClient {
     _menu.close();
     _status.close();
     _connected.close();
+    _collect.close();
+    _voids.close();
   }
 }

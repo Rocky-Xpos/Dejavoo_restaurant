@@ -2,6 +2,10 @@
     <!-- LAN sockets (WebSocket to the register + UDP discovery) -->
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+    <!-- invoke-dvpay-lite: the SDK must see and launch the DvPayLite payment
+         app installed on this same terminal (Android 11+ package visibility;
+         required per the Dejavoo DvPayLite intent-mode integration guide). -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>
     <application
         android:label="XPOS Tableside"
         android:name="${applicationName}"
