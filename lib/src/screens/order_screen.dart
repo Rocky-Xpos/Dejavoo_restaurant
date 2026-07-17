@@ -1,3 +1,6 @@
+import 'dart:async';
+import 'dart:math';
+
 import 'package:flutter/material.dart';
 
 import '../client.dart';
@@ -29,7 +32,30 @@ class _OrderScreenState extends State<OrderScreen> {
   final List<CartLine> _cart = [];
   bool _sending = false;
 
+  /// Idempotency token for the current send attempt: created on first Send,
+  /// reused on retries, cleared once the register confirms.
+  String? _orderToken;
+  StreamSubscription? _menuSub;
+
   MenuData get _menu => widget.client.lastMenu;
+
+  @override
+  void initState() {
+    super.initState();
+    // Live menu updates (86'd items vanish without a manual refresh).
+    _menuSub = widget.client.menu.listen((_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _menuSub?.cancel();
+    super.dispose();
+  }
+
+  String _newToken() =>
+      '${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}-${Random().nextInt(1 << 31).toRadixString(36)}';
 
   Future<void> _addItem(MenuItemM item) async {
     final groups = _menu.groupsForItem(item);
@@ -285,11 +311,13 @@ class _OrderScreenState extends State<OrderScreen> {
   Future<void> _send() async {
     if (_cart.isEmpty || _sending) return;
     setState(() => _sending = true);
-    final resp =
-        await widget.client.placeOrder(checkId: widget.checkId, lines: _cart);
+    _orderToken ??= _newToken();
+    final resp = await widget.client.placeOrder(
+        checkId: widget.checkId, lines: _cart, orderToken: _orderToken);
     if (!mounted) return;
     setState(() => _sending = false);
     if (resp['type'] == 'order_placed') {
+      _orderToken = null;
       final printErrors = (resp['printErrors'] as List? ?? []);
       await showDialog(
         context: context,

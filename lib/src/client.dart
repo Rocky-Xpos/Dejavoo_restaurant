@@ -180,12 +180,17 @@ class OrderClient {
   }
 
   /// Places a batch of cart lines on a check and fires the kitchen.
+  ///
+  /// [orderToken] must stay the SAME across retries of one send attempt — the
+  /// register uses it to make the verb idempotent (a retry after a timeout
+  /// can never double-add the items).
   Future<Map<String, dynamic>> placeOrder(
-      {required int checkId, required List<CartLine> lines}) {
+      {required int checkId, required List<CartLine> lines, String? orderToken}) {
     return _request('order_placed', {
       'type': 'place_order',
       'checkId': checkId,
       'send': true,
+      'orderToken': ?orderToken,
       'items': [for (final l in lines) l.toOrderJson()],
     });
   }
